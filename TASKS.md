@@ -1,7 +1,8 @@
 # TASKS — LAB 17 Data Pipeline Engineering
 
-Trạng thái sau khi cài môi trường: **1/4 tiêu chí đạt** (chỉ có `gold_doc_chunks` —
-nhóm đối chứng, không có lỗi).
+Trạng thái hiện tại: **4/4 tiêu chí đạt** — cả 3 nhiệm vụ chính đã xong, đã commit
+và push (`ea556c8`, `09ea8a5`, `a2ce84d`). Còn lại: viết báo cáo theo
+`REPORT_TEMPLATE.md`.
 
 ## Môi trường (đã xong)
 
@@ -29,43 +30,42 @@ duckdb.connect('warehouse.duckdb').sql(sys.argv[1]).show(max_rows=40)
 
 ---
 
-## Nhiệm vụ 1 — `gold_training_set` tăng row mỗi lần chạy
+## Nhiệm vụ 1 — `gold_training_set` tăng row mỗi lần chạy — ✅ XONG
 
-Hiện tại: 38.750 row, kỳ vọng 12.480. Checksum lệch qua 3 lượt → không idempotent.
+Đã sửa (commit `ea556c8`):
 
-- [ ] `dbt/models/gold/gold_training_set.sql` — bổ sung `unique_key` +
-      `incremental_strategy` vào `config()`. Grain là **entity** (1 ticket), không
-      phải event; source có `op = 'u'` nên một ticket rơi vào hai partition ngày
-      khác nhau trong cùng một lượt.
-- [ ] `dags/ai_training_pipeline.py` — set `catchup` và `max_active_runs` ở phần
-      `TODO`. Hiện là `True / None`.
+- [x] `dbt/models/gold/gold_training_set.sql` — `unique_key = 'ticket_id'`,
+      `incremental_strategy = 'merge'`. Grain là **entity** (1 ticket); source
+      có `op = 'u'` nên một ticket rơi vào hai partition ngày khác nhau trong
+      cùng một lượt → cần merge theo khoá, không phải append.
+- [x] `dags/ai_training_pipeline.py` — `catchup=False`, `max_active_runs=1`.
 
-Xong khi: `gold_training_set` = 12.480, `ỔN ĐỊNH` ✓, dòng `1 hàng / 1 ticket` ✓,
-dòng `DAG: catchup / max_active_runs` ✓.
+Kết quả: `gold_training_set` = 12.480, `ỔN ĐỊNH` ✓, `1 hàng / 1 ticket` ✓,
+`DAG: catchup / max_active_runs` ✓.
 
 Lưu ý: hai parameter DAG chỉ giảm tần suất kích hoạt, **không phải root cause**.
 
 ---
 
-## Nhiệm vụ 2 — `gold_feature_daily` thiếu row ở ngày cũ
+## Nhiệm vụ 2 — `gold_feature_daily` thiếu row ở ngày cũ — ✅ XONG
 
-Hiện tại: 8.645 row, kỳ vọng 9.100 (14 ngày × 650 customer). Thiếu 455.
+Đã sửa (commit `09ea8a5`):
 
-- [ ] Đo P99 độ trễ `event_time` → `_ingested_at` trên `bronze_events`.
-      **Ghi con số này vào report** — rubric bắt buộc.
-- [ ] `dbt/models/gold/gold_feature_daily.sql` — thay
-      `where event_date > (select max(event_date) from {{ this }})` bằng lookback
-      window đủ rộng, căn cứ P99.
-- [ ] Cùng file — thêm `unique_key` dạng list hai cột `(event_date, customer_id)`,
-      nếu không window rộng hơn sẽ cộng dồn đúng như lỗi nhiệm vụ 1.
+- [x] Đo P99 độ trễ `event_time` → `_ingested_at` trên `bronze_events`:
+      **P99 = 2,73 ngày** (max = 2,94 ngày; ~5% bản ghi tới muộn hơn 1 ngày).
+- [x] `dbt/models/gold/gold_feature_daily.sql` — đổi điều kiện lọc thành
+      `where event_date > (select max(event_date) from {{ this }}) - interval 3 day`
+      (lùi 3 ngày để phủ hết P99).
+- [x] Cùng file — thêm `unique_key = ['event_date', 'customer_id']` +
+      `incremental_strategy = 'merge'` để window rộng hơn không cộng dồn.
 
-Xong khi: `gold_feature_daily` = 9.100 và `ỔN ĐỊNH` ✓, `gold_training_set` giữ 12.480.
+Kết quả: `gold_feature_daily` = 9.100, `ỔN ĐỊNH` ✓, `gold_training_set` giữ 12.480.
 
 ---
 
-## Nhiệm vụ 3 — Kiểu dữ liệu cột `priority` đổi giữa chu kỳ
+## Nhiệm vụ 3 — Kiểu dữ liệu cột `priority` đổi giữa chu kỳ — ✅ XONG
 
-Hiện tại: 6.606 row `priority` sai/NULL, `quarantine_tickets` = 0 (kỳ vọng 312).
+Đã sửa (commit `a2ce84d`):
 
 Ba nhóm giá trị `priority_raw`, xử lý khác nhau:
 
@@ -75,17 +75,16 @@ Ba nhóm giá trị `priority_raw`, xử lý khác nhau:
 | Nhãn chuỗi | `urgent` `high` `medium` `low` | map → `1` `2` `3` `4` |
 | Không hợp lệ | `P1` `unknown` `0` `5` `-1` `''` `null` | quarantine |
 
-- [ ] `dbt/macros/normalize_priority.sql` — thay `try_cast(...)` bằng `CASE` đủ ba
-      nhóm, trả `NULL` cho nhóm 3. Cả hai model dùng chung macro này.
-- [ ] `dbt/models/silver/silver_tickets.sql` — **lọc trước, `row_number` sau**.
-      Làm ngược lại thì số ticket tụt 12.480 → 12.168.
-- [ ] `dbt/models/silver/quarantine_tickets.sql` — thay `where false` bằng điều
-      kiện "macro trả về NULL".
-- [ ] `dbt/models/silver/schema.yml` — `enforced: true`, bỏ comment khối `tests:`
-      ở cột `priority`, điền danh sách giá trị hợp lệ.
+- [x] `dbt/macros/normalize_priority.sql` — `CASE` xử lý đủ ba nhóm, trả `NULL`
+      cho nhóm 3. Cả hai model dùng chung macro này.
+- [x] `dbt/models/silver/silver_tickets.sql` — lọc trước (`where normalize_priority(...)
+      is not null`), `row_number` sau.
+- [x] `dbt/models/silver/quarantine_tickets.sql` — `where normalize_priority(...) is null`.
+- [x] `dbt/models/silver/schema.yml` — `enforced: true`, thêm `tests: [not_null,
+      accepted_values [1,2,3,4]]` ở cột `priority`.
 
-Xong khi: `dbt test` ✓ với **> 9 test**, `priority ∈ 1..4 không NULL` ✓,
-`quarantine_tickets` = 312 và `ỔN ĐỊNH` ✓, `gold_training_set` giữ 12.480.
+Kết quả: `dbt test` ✓ 11/11, `priority ∈ 1..4 không NULL` ✓, `quarantine_tickets`
+= 312, `ỔN ĐỊNH` ✓, `gold_training_set` giữ 12.480.
 
 ---
 
