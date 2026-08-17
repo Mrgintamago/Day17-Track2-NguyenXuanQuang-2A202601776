@@ -13,9 +13,9 @@
   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   LAB 17 · make verify
   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  run 1/3 … 88.1s
-  run 2/3 … 63.7s
-  run 3/3 … 64.1s
+  run 1/3 … 113.1s
+  run 2/3 … 68.6s
+  run 3/3 … 72.9s
 
   BẢNG                  ỔN ĐỊNH          SỐ HÀNG     KỲ VỌNG   GHI CHÚ
   ──────────────────────────────────────────────────────────────────────────
@@ -37,8 +37,8 @@
   silver_tickets.priority ∈ 1..4, không NULL  ✓ sạch
   quarantine_tickets đúng số bản ghi lỗi      ✓ 312 / 312
   gold_training_set: 1 hàng / 1 ticket        ✓ không lặp
-  dashboard rows scanned                      ✗ 5,000,000 → 5,000,000 (1.0×, cần ≥ 10×)
-    số file parquet                           ✗ 5,000 → 5,000
+  dashboard rows scanned                      ✓ 5,000,000 → 9,324 (536.3×, cần ≥ 10×)
+    số file parquet                           ✓ 5,000 → 14
     kết quả truy vấn không đổi                ✓
   DAG: catchup / max_active_runs              ✓ False / 1
 
@@ -50,6 +50,27 @@
   ✓  4 · gold_doc_chunks vẫn ổn định (đối chứng)
   ──────────────────────────────────────────────────────────────────────────
   4/4 tiêu chí đạt
+```
+
+```
+  topic: 20,000 message · batch 500 · giết ở lô 7
+
+  A. chạy một mạch, không sự cố
+     -> 20,000 hàng / 20,000 event_id khác nhau
+
+  B. chạy và bị giết ở lô 7
+     -> tiến trình thoát với mã 137
+     -> offset đã commit: 3,000
+
+  C. khởi động lại, chạy nốt
+     -> 20,000 hàng / 20,000 event_id khác nhau
+
+  ----------------------------------------------------------
+  không mất bản ghi                 ✓
+  không trùng bản ghi               ✓
+  C == A                            ✓
+  ----------------------------------------------------------
+  BÀI MỞ RỘNG B: ĐẠT ✓
 ```
 
 </details>
@@ -106,12 +127,27 @@ Câu hỏi thiết kế: nên chặn ở tầng Bronze hay Silver? Vì sao **kh�
 
 ## 4 · *(mở rộng, không bắt buộc)* Bài trong EXTRA.md
 
+### 4A · Query dashboard chậm
+
 | | |
 |---|---|
-| **Bài đã làm** | không làm |
-| **Nguyên nhân** | — |
-| **Cách khắc phục** | — |
-| **Bằng chứng** | — |
+| **Triệu chứng** | `queries/dashboard.sql` quét 5.000.000 "rows scanned" cho một truy vấn chỉ trả về 1 hàng, trên `data/gold_events/` gồm 5.000 file Parquet nhỏ, mỗi file vài chục KB, không partition, thứ tự hàng ngẫu nhiên. `rows on disk` thực tế chỉ 130.683. |
+| **Nguyên nhân** | Hai vấn đề cộng dồn. (1) Small-file problem: DuckDB đọc Parquet theo lô và làm tròn lên theo file, một file vài chục hàng vẫn tốn khối lượng đọc tương đương ~1.000 hàng, nhân với 5.000 file ra đúng 5.000.000. (2) Predicate không sargable: điều kiện `strftime(event_time, '%Y-%m-%d') = '2026-08-09'` bọc cột trong hàm, engine không so được với min/max statistics của row group hay với tên thư mục partition, nên phải mở toàn bộ file rồi mới lọc được. Tên file `part-00000.parquet`...`part-04999.parquet` không mang thông tin của cột nào (không phải ngày, không phải khách hàng), engine không có cách nào bỏ qua file trước khi mở. |
+| **Cách khắc phục** | `tools/compact.py`: đọc lại toàn bộ `data/gold_events/`, ghi ra `data/gold_events_v2/` với `PARTITION_BY (event_date)`: 14 giá trị phân biệt nên ra đúng 14 thư mục, không rơi vào bẫy partition-cardinality-cao (nếu partition theo `customer_name` sẽ ra 650 thư mục, mỗi thư mục vài chục hàng, tái tạo lại chính vấn đề small-file cũ). `ORDER BY event_date, customer_name, event_time` để các hàng cùng khách hàng nằm liền nhau, giúp min/max của mỗi row group hẹp lại theo `customer_name`. `ROW_GROUP_SIZE 2000` (mặc định 122.880, trong khi một ngày chỉ có ~9.335 hàng) để một ngày tách thành nhiều row group thay vì gói gọn trong một row group duy nhất. Nếu chỉ một row group thì min/max của nó phủ toàn bộ 650 khách hàng, mất tác dụng lọc. `queries/dashboard.sql`: trỏ sang `read_parquet('data/gold_events_v2/**/*.parquet', hive_partitioning = true)` và viết lại điều kiện thành `event_date = date '2026-08-09'`, cột đứng một mình, sargable, tận dụng được cả partition pruning lẫn row-group statistics. |
+| **Bằng chứng** | rows scanned: 5.000.000 → 9.324 (giảm 536,3×, cần ≥ 10×) · files: 5.000 → 14 · result hash không đổi (`4379e4c5d9f3` cả trước lẫn sau) · `make verify` vẫn 4/4 tiêu chí chính đạt |
+
+### 4B · Consumer gặp sự cố giữa batch
+
+| | |
+|---|---|
+| **Triệu chứng** | `make crash-test` kill tiến trình consumer ở giữa lô thứ 7 rồi khởi động lại. Với thứ tự thao tác ban đầu (`commit()` → `maybe_crash()` → `write_batch()`), lô bị crash coi như mất: offset đã dịch tới cuối lô 7 nhưng dữ liệu của lô đó chưa kịp ghi, lần khởi động lại đọc tiếp từ sau lô 7 nên lô đó biến mất vĩnh viễn: **at-most-once**, mất dữ liệu, không có báo lỗi nào. |
+| **Nguyên nhân** | `commit()` chạy trước `write_batch()`, nên với văn bản mã gốc, offset được coi là "đã xử lý xong" trước khi dữ liệu thực sự nằm trên đĩa. `maybe_crash()` mô phỏng `kill -9`, chết ngay tại chỗ, không rollback, nên khoảng thời gian giữa `commit()` và `write_batch()` là một cửa sổ mất dữ liệu thật. Ngoài ra `write_batch()` dùng `INSERT` thuần trên bảng không có khoá duy nhất, nên nếu đổi thứ tự sang ghi trước/commit sau (at-least-once) mà không sửa gì thêm, một lô bị phát lại sau restart sẽ tạo ra các hàng `event_id` trùng lặp. |
+| **Cách khắc phục** | `ingest/consumer.py`: đổi thứ tự thành `write_batch()` → `maybe_crash()` → `consumer.commit()`: ghi dữ liệu trước, commit offset sau. Nếu crash xảy ra ở `maybe_crash()`, dữ liệu của lô đã nằm trên đĩa nhưng offset chưa dịch, nên lần khởi động lại đọc lại đúng lô đó thay vì bỏ sót nó (chuyển từ at-most-once sang at-least-once, có thể phát lại nhưng không mất). Để việc phát lại không sinh hàng trùng: thêm `primary key` trên `event_id` trong `DDL`, và đổi `write_batch()` sang `insert ... on conflict (event_id) do update set ...` thay vì `INSERT` thuần. Lô bị phát lại ghi đè đúng những hàng đã có bằng cùng nội dung, không tạo hàng mới. |
+| **Bằng chứng** | `make crash-test`: lượt A (không sự cố) ghi 20.000 hàng / 20.000 `event_id` khác nhau · lượt B bị giết ở lô 7, offset commit dừng ở 3.000 · lượt C khởi động lại ghi nốt, kết quả cuối 20.000 hàng / 20.000 `event_id` khác nhau, `C == A`, không mất, không trùng → BÀI MỞ RỘNG B: ĐẠT · `make verify` sau đó vẫn 4/4 tiêu chí chính đạt, không bị ảnh hưởng |
+
+**Câu hỏi thiết kế (Bài B):** `DO UPDATE` khác `DO NOTHING` ở điểm nào khi một message được phát lại với nội dung đã đổi?
+
+> `DO NOTHING` giữ nguyên bản ghi đầu tiên ứng với `event_id` đó và bỏ qua mọi lần ghi sau, kể cả khi nội dung message đã thay đổi giữa các lần phát lại, phù hợp nếu message với cùng khoá luôn bất biến. `DO UPDATE` ghi đè bằng nội dung mới nhất mỗi lần phát lại, nên nếu message có thể mang một phiên bản dữ liệu mới hơn dưới cùng `event_id` (ví dụ retry sau khi sửa lỗi ở tầng producer), `DO UPDATE` đảm bảo bảng luôn phản ánh đúng nội dung cuối cùng thay vì đóng băng ở lần ghi đầu. Trong kịch bản crash-test, hai lựa chọn cho kết quả giống nhau vì lô bị phát lại có nội dung y hệt lô đã ghi (không đổi giữa hai lần), nhưng `DO UPDATE` là lựa chọn an toàn hơn về lâu dài nên được chọn ở đây.
 
 ---
 

@@ -53,7 +53,7 @@ TABLE = "bronze_events_stream"
 
 DDL = f"""
 create table if not exists {TABLE} (
-    event_id      varchar,
+    event_id      varchar primary key,
     ticket_id     varchar,
     customer_id   varchar,
     customer_name varchar,
@@ -68,11 +68,24 @@ create table if not exists {TABLE} (
 def write_batch(con: duckdb.DuckDBPyConnection, batch: list[dict]) -> None:
     """Ghi một lô message xuống kho — nhiệm vụ 5, hạng mục (b).
 
-    Câu lệnh hiện tại là INSERT thuần: ghi lại cùng một event_id sẽ tạo thêm
-    một hàng mới. Xem khung mã giả ở đầu file.
+    UPSERT theo event_id: nếu lô này được phát lại (sau khi restart từ một
+    offset đã lùi lại), ghi đè đúng những hàng cũ bằng nội dung mới thay vì
+    tạo thêm hàng trùng — DO UPDATE để dữ liệu luôn phản ánh bản mới nhất của
+    message, khác DO NOTHING vốn giữ nguyên bản ghi đầu tiên dù nội dung đã
+    đổi.
     """
     con.executemany(
-        f"insert into {TABLE} values (?, ?, ?, ?, ?, ?, ?, ?)",
+        f"""
+        insert into {TABLE} values (?, ?, ?, ?, ?, ?, ?, ?)
+        on conflict (event_id) do update set
+            ticket_id     = excluded.ticket_id,
+            customer_id   = excluded.customer_id,
+            customer_name = excluded.customer_name,
+            event_type    = excluded.event_type,
+            latency_ms    = excluded.latency_ms,
+            event_time    = excluded.event_time,
+            _ingested_at  = excluded._ingested_at
+        """,
         [
             (
                 r["event_id"], r["ticket_id"], r["customer_id"], r["customer_name"],
@@ -110,11 +123,14 @@ def consume(
             batch_no += 1
 
             # ── KHỐI CẦN XEM XÉT — nhiệm vụ 5, hạng mục (a) ───────────────
-            # Ba dòng dưới đây được phép sắp xếp lại. maybe_crash() mô phỏng
-            # `kill -9`: tiến trình chết ngay tại vị trí của nó, không rollback.
-            consumer.commit()                 # ghi nhận offset
-            maybe_crash(batch_no, crash_at)   # sự cố xảy ra tại đây
+            # Ghi dữ liệu TRƯỚC, commit offset SAU: nếu chết ở maybe_crash(),
+            # dữ liệu của lô đã nằm trên đĩa nhưng offset chưa dịch, nên lần
+            # khởi động lại sẽ đọc lại đúng lô đó (at-least-once, có thể phát
+            # lại) thay vì bỏ sót nó (at-most-once). write_batch() ở trên đã
+            # là UPSERT nên phát lại không tạo hàng trùng.
             write_batch(con, batch)           # ghi dữ liệu
+            maybe_crash(batch_no, crash_at)   # sự cố xảy ra tại đây
+            consumer.commit()                 # ghi nhận offset
             # ─────────────────────────────────────────────────────────────
 
             written += len(batch)
